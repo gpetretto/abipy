@@ -9,10 +9,11 @@ import linecache
 from copy import copy
 from collections import defaultdict
 from abipy.core.func1d import Function1D
-from pymatgen.electronic_structure.core import Spin, Orbital, OrbitalType
+from abipy.electrons.gsr import GsrFile
+from pymatgen.electronic_structure.core import OrbitalType
 from pymatgen.io.vasp.outputs import Vasprun
 from pymatgen.io.vasp.inputs import Potcar
-from pymatgen.io.abinit.netcdf import structure_from_ncdata, ETSF_Reader
+from pymatgen.io.abinit.pseudos import Pseudo
 from monty.collections import tree
 from monty.io import zopen
 from monty.functools import lazy_property
@@ -20,41 +21,71 @@ from monty.functools import lazy_property
 
 class Coxp(object):
     """
-    Warapper class for the crystal orbital projections produced from Lobster.
+    Wrapper class for the crystal orbital projections produced from Lobster.
     Wraps both a COOP and a COHP.
     Can contain both the total and orbitalwise projections.
     """
 
-    def __init__(self, energies, total=None, partial=None, averaged=None, efermi=None):
+    def __init__(self, energies, total=None, partial=None, averaged=None, fermie=None):
+        """
+        Args:
+            energies: list of energies. Shifted such that the Fermi level lies at 0 eV.
+            total:  a dictionary with the values of the total overlap, not projected over orbitals.
+                The dictionary should have the following nested keys: a tuple with the index of the sites
+                considered as a pair (0-based, e.g. (0,1)), the spin (i.e. 0 or 1), a "single"
+                or "integrated" string indicating the value corresponding to the value of
+                the energy or to the integrated value up to that energy.
+            partial: a dictionary with the values of the partial crystal orbital projections.
+                The dictionary should have the following nested keys: a tuple with the index of the sites
+                considered as a pair (0-based, e.g. (0,1)), a tuple with the string representing the
+                projected orbitals for that pair (e.g. ("4s", "4p_x")), the spin (i.e. 0 or 1),
+                a "single" or "integrated" string indicating the value corresponding to the value of
+                the energy or to the integrated value up to that energy. Each dictionary should contain a
+                numpy array with a list of COP values with the same size as energies.
+            averaged: a dictionary with the values of the partial crystal orbital projections
+                averaged over all atom pairs specified. The main key should indicate the spin (0 or 1)
+                and the nested dictionary should have "single" and "integrated" as keys.
+            fermie: value of the fermi energy.
+        """
         self.energies = energies
-        self._total_only = total or {}
         self.partial = partial or {}
         self.averaged = averaged or {}
-        self.efermi = efermi
+        self.fermie = fermie
+        self.total = total
 
-        self.total = copy(self._total_only)
-
-        # create the total distribution from the partial
-        for index_pair, data in partial.items():
-            if index_pair not in total:
-                self.total[index_pair] = six.moves.reduce(add_coxp, data.values())
-                self.total[(index_pair[1], index_pair[0])] = self.total[index_pair]
-
+    @property
     def site_pairs_total(self):
-        return [i for i in self.total.keys()]
+        """
+        List of site pairs available for the total COP
+        """
+        return list(self.total.keys())
 
+    @property
     def site_pairs_partial(self):
-        return [i for i in self.partial.keys()]
+        """
+        List of site pairs available for the partial COP
+        """
+        return list(self.partial.keys())
 
     @classmethod
     def from_file(cls, filepath):
+        """
+        Generates an instance of Coxp from the files produce by Lobster.
+        Accepts gzipped files.
+
+        Args:
+            filepath: path to the COHPCAR.lobster or COOPCAR.lobster.
+
+        Returns:
+            A Coxp.
+        """
 
         float_patt = r'-?(?:0|[1-9]\d*)(?:\.\d*)?(?:[eE][+\-]?\d+)?'
         header_patt = re.compile(r'\s+(\d+)\s+(\d+)\s+(\d+)\s+('+float_patt+
                                  r')\s+('+float_patt+r')\s+('+float_patt+r')')
         pair_patt = re.compile(r'No\.\d+:([a-zA-Z]+)(\d+)(?:\[([a-z0-9_\-^]+)\])?->([a-zA-Z]+)(\d+)(?:\[([a-z0-9_\-^]+)\])?')
 
-        with zopen(filepath) as f:
+        with zopen(filepath, "rt") as f:
             #find the header
             for line in f:
                 match = header_patt.match(line.rstrip())
@@ -64,7 +95,7 @@ class Coxp(object):
                     n_en_steps = int(match.group(3))
                     min_en = float(match.group(4))
                     max_en = float(match.group(5))
-                    efermi = float(match.group(6))
+                    fermie = float(match.group(6))
                     break
             else:
                 raise ValueError("Can't find the header in file {}".format(filepath))
@@ -77,15 +108,18 @@ class Coxp(object):
             for line in f:
                 match = pair_patt.match(line.rstrip())
                 if match:
-                    # adds a tuple: [type_1, index_1, orbital_1, type_2, index_2, orbital_2]
-                    # with orbital_1, orbital_2 = None if the pair is not orbitalwise
-                    type_1, index_1, orbital_1, type_2, index_2, orbital_2 = match.groups()
-                    pairs_data.append([type_1, int(index_1), orbital_1, type_2, int(index_2), orbital_2])
+                    # adds a tuple: [type1, index1, orbital1, type2, index2, orbital2]
+                    # with orbital1, orbital2 = None if the pair is not orbitalwise
+                    type1, index1, orbital1, type2, index2, orbital2 = match.groups()
+                    #0-based indexing
+                    index1 = int(index1) - 1
+                    index2 = int(index2) - 1
+                    pairs_data.append([type1, index1, orbital1, type2, index2, orbital2])
                     count_pairs += 1
                     if count_pairs == n_pairs:
                         break
 
-            spins = [Spin.up, Spin.down][:n_spin]
+            spins = [0, 1][:n_spin]
 
             data = np.fromstring(f.read(), dtype=np.float, sep=' ').reshape([n_en_steps, 1+n_spin*n_column_groups*2])
 
@@ -100,26 +134,32 @@ class Coxp(object):
                 averaged[s]['single'] = data[:, base_index]
                 averaged[s]['integrated'] = data[:, base_index+1]
                 for j, p in enumerate(pairs_data):
+                    index1 = p[1]
+                    index2 = p[4]
                     # partial or total
                     if p[2] is not None:
                         single = data[:, base_index+2*(j+1)]
                         integrated = data[:, base_index+2*(j+1)+1]
-                        partial[(p[1], p[4])][(p[2], p[5])][s]['single'] = single
-                        partial[(p[4], p[1])][(p[5], p[2])][s]['single'] = single
-                        partial[(p[1], p[4])][(p[2], p[5])][s]['integrated'] = integrated
-                        partial[(p[4], p[1])][(p[5], p[2])][s]['integrated'] = integrated
+                        partial[(index1, index2)][(p[2], p[5])][s]['single'] = single
+                        partial[(index2, index1)][(p[5], p[2])][s]['single'] = single
+                        partial[(index1, index2)][(p[2], p[5])][s]['integrated'] = integrated
+                        partial[(index2, index1)][(p[5], p[2])][s]['integrated'] = integrated
                     else:
                         single = data[:, base_index+2*(j+1)]
                         integrated = data[:, base_index+2*(j+1)+1]
-                        total[(p[1], p[4])][s]['single'] = single
-                        total[(p[4], p[1])][s]['single'] = single
-                        total[(p[1], p[4])][s]['integrated'] = integrated
-                        total[(p[4], p[1])][s]['integrated'] = integrated
+                        total[(index1, index2)][s]['single'] = single
+                        total[(index2, index1)][s]['single'] = single
+                        total[(index1, index2)][s]['integrated'] = integrated
+                        total[(index2, index1)][s]['integrated'] = integrated
 
-        return cls(energies=energies, total=total, partial=partial, averaged=averaged, efermi=efermi)
+        return cls(energies=energies, total=total, partial=partial, averaged=averaged, fermie=fermie)
 
     @lazy_property
-    def get_dos_pair_lorbitals(self):
+    def functions_pair_lorbitals(self):
+        """
+        Extracts a dictionary with keys pair, orbital, spin and containing a Function1D object resolved
+        for l orbitals.
+        """
         if not self.partial:
             raise RuntimeError("Partial orbitals not calculated.")
 
@@ -144,7 +184,12 @@ class Coxp(object):
         return results
 
     @lazy_property
-    def get_dos_pair_morbitals(self):
+    def functions_pair_morbitals(self):
+        """
+        Extracts a dictionary with keys pair, orbital, spin and containing a Function1D object resolved
+        for l and m orbitals.
+        """
+
         if not self.partial:
             raise RuntimeError("Partial orbitals not calculated.")
         results = tree()
@@ -155,67 +200,151 @@ class Coxp(object):
         return results
 
     @lazy_property
-    def get_dos_pair(self):
+    def functions_pair(self):
+        """
+        Extracts a dictionary with keys pair, spin and containing a Function1D object for the total COP.
+        """
+
         results = tree()
         for pair, pair_data in self.total.items():
             for spin in pair_data.keys():
                 results[pair][spin] = Function1D(self.energies, pair_data[spin]['single'])
         return results
 
-    @lazy_property
-    def get_partial_lorbitals(self):
-        results = tree()
-        for pair, pair_data in self.partial.items():
-            #check if the symmetric has already been calculated
-            if (pair[1], pair[0]) in results:
-                for orbs, orbs_data in results[(pair[1], pair[0])].items():
-                    results[pair][(orbs[1], orbs[0])] = orbs_data
-                continue
-
-            #for each look at all orbital possibilities
-            for orbs, orbs_data in pair_data.items():
-                k=(orbs[0].split("_")[0], orbs[1].split("_")[0])
-                for spin in orbs_data:
-                    results[pair][k][spin]['single'] = results[pair][k][spin].get('single', np.zeros(len(orbs_data[spin]['single'])))+orbs_data[spin]['single']
-                    results[pair][k][spin]['integrated'] = results[pair][k][spin].get('integrated', np.zeros(len(orbs_data[spin]['integrated'])))+orbs_data[spin]['integrated']
-
-        return results
-
 
 class ICoxp(object):
+    """
+    Wrapper class for the integrated crystal orbital projections up to the Fermi energy
+    produced from Lobster.
+    May contain the output stored in ICOHPLIST.lobster and ICOOPLIST.lobster
+    """
 
-    def __init__(self, averages):
-        self.averages = averages
+    def __init__(self, values):
+        """
+        Args:
+            values: a dictionary with the following keys: a tuple with the index of the sites
+                considered as a pair (0-based, e.g. (0,1)), the spin (i.e. 0 or 1)
+        """
+        self.values = values
 
     @classmethod
     def from_file(cls, filepath):
+        """
+        Generates an instance of ICoxp from the files produce by Lobster.
+        Accepts gzipped files.
+
+        Args:
+            filepath: path to the ICOHPLIST.lobster or ICOOPLIST.lobster.
+
+        Returns:
+            A ICoxp.
+        """
         float_patt = r'-?(?:0|[1-9]\d*)(?:\.\d*)?(?:[eE][+\-]?\d+)?'
         header_patt = re.compile(r'.*?(over+\s#\s+bonds)?\s+for\s+spin\s+(\d).*')
         data_patt = re.compile(r'\s+\d+\s+([a-zA-Z]+)(\d+)\s+([a-zA-Z]+)(\d+)\s+('+
                                float_patt+r')\s+('+float_patt+r')(\d+)?')
-        averages = {}
+        values = tree()
         spin = None
         avg_num_bonds = False
-        with zopen(filepath) as f:
+        with zopen(filepath, "rt") as f:
             for line in f:
                 match = header_patt.match(line.rstrip())
                 if match:
-                    spin = [Spin.up, Spin.down][int(match.group(2))-1]
+                    spin = [0, 1][int(match.group(2))-1]
                     avg_num_bonds = match.group(1) is not None
-                    averages[spin] = defaultdict(dict)
                 match = data_patt.match(line.rstrip())
                 if match:
-                    type_1, index_1, type_2, index_2, dist, avg, n_bonds = match.groups()
+                    type1, index1, type2, index2, dist, avg, n_bonds = match.groups()
+                    #0-based indexing
+                    index1 = int(index1) - 1
+                    index2 = int(index2) - 1
                     avg_data = {'average': float(avg), 'distance': dist, 'n_bonds': int(n_bonds) if n_bonds else None}
-                    averages[spin][(int(index_1), int(index_2))] = avg_data
-                    averages[spin][(int(index_2), int(index_1))] = avg_data
+                    values[(index1, index2)][spin] = avg_data
+                    values[(index2, index1)][spin] = avg_data
 
-        return cls(averages)
+        return cls(values)
+
+
+class LobsterDos(object):
+    """
+    Total and partial dos extracted from lobster DOSCAR.
+    The fermi energy is always at the zero value.
+    """
+
+    def __init__(self, energies, total_dos, pdos):
+        """
+
+        Args:
+            energies: list of energies. Shifted such that the Fermi level lies at 0 eV.
+            total_dos: a dictionary with spin as a key (i.e. 0 or 1) and containing the values of the total DOS.
+                Should have the same size as energies.
+            pdos: a dictionary with the values of the projected DOS.
+                The dictionary should have the following nested keys: the index of the site (0-based),
+                the string representing the projected orbital (e.g. "4p_x"), the spin (i.e. 0 or 1).
+                Each dictionary should contain a numpy array with a list of DOS values with the
+                same size as energies.
+        """
+
+        self.energies = energies
+        self.total_dos = total_dos
+        self.pdos = pdos
+
+    @classmethod
+    def from_file(self, filepath):
+        """
+        Generates an instance from the DOSCAR.lobster file.
+        Accepts gzipped files.
+
+        Args:
+            filepath: path to the DOSCAR.lobster.
+
+        Returns:
+            A LobsterDos.
+        """
+
+        with zopen(filepath, "rt") as f:
+            dos_data = f.readlines()
+
+        n_sites = int(dos_data[0].split()[0])
+        n_energies = int(dos_data[5].split()[2])
+
+        n_spin = 1 if len(dos_data[6].split()) == 3 else 2
+        spins = [0, 1][:n_spin]
+
+        # extract np array for total dos
+        tdos_data = np.fromiter((d for l in dos_data[6:6+n_energies] for d in l.split()),
+                                dtype=np.float).reshape((n_energies, 1+2*n_spin))
+
+        energies = tdos_data[:,0]
+        total_dos = {}
+        for i_spin, spin in enumerate(spins):
+            total_dos[spin] = tdos_data[:,1+2*i_spin]
+
+        pdos = tree()
+        # read partial doses
+        for i_site in range(n_sites):
+            i_first_line = 5+(n_energies+1)*(i_site+1)
+
+            # read orbitals
+            orbitals = dos_data[i_first_line].rsplit(';', 1)[-1].split()
+
+            # extract np array for partial dos
+            pdos_data = np.fromiter((d for l in dos_data[i_first_line+1:i_first_line+1+n_energies] for d in l.split()),
+                dtype=np.float).reshape((n_energies, 1+n_spin*len(orbitals)))
+
+            for i_orb, orb in enumerate(orbitals):
+                for i_spin, spin in enumerate(spins):
+                    pdos[i_site][orb][spin] = pdos_data[:, i_spin+n_spin*i_orb+1]
+
+        return LobsterDos(energies=energies, total_dos=total_dos, pdos=pdos)
 
 
 class LobsterInput(object):
+    """
+    This object stores the basic variables for a Lobster input and generates the lobsterin file.
+    """
 
-    basis_sets = {"bunge", "koga", "pbevaspfit2015"}
+    accepted_basis_sets = {"bunge", "koga", "pbevaspfit2015"}
 
     available_advanced_options = {"basisRotation", "writeBasisFunctions", "onlyReadVasprun.xml", "noMemoryMappedFiles",
                                   "skipPAWOrthonormalityTest", "doNotIgnoreExcessiveBands", "doNotUseAbsoluteSpilling",
@@ -244,7 +373,7 @@ class LobsterInput(object):
             advanced_options: dict with additional advanced options. See lobster user guide for further details
         """
 
-        if basis_set and basis_set.lower() not in self.basis_sets:
+        if basis_set and basis_set.lower() not in self.accepted_basis_sets:
             raise ValueError("Wrong basis set {}".format(basis_set))
         self.basis_set = basis_set
         self.basis_functions = basis_functions or []
@@ -258,36 +387,57 @@ class LobsterInput(object):
         self.gaussian_smearing = gaussian_smearing
         self.bwdf = bwdf
         self.advanced_options = advanced_options or {}
+
         if not all(opt in self.available_advanced_options for opt in self.advanced_options.keys()):
             raise ValueError("Unknown adavanced options")
 
     @classmethod
     def _get_basis_functions_from_abinit_pseudos(cls, pseudos):
+        """
+        Extracts the basis function used from the PAW abinit pseudopotentials
+
+        Args:
+            pseudos: a list of Pseudos objects.
+        """
+
         basis_functions = []
         for p in pseudos:
-            basis_functions.append(p.symbol + " ".join(str(vs['n']) + OrbitalType(vs['l']).name)
-                                   for vs in p.valence_states.values() if 'n' in vs)
-            # bf = p.symbol
-            # for vs in pseudo.valence_states.values():
-            # if 'n' in vs:
-            #         bf += " {}{}".format(vs['n'], OrbitalType(vs['l']).name)
-            #
-            # basis_functions.append(bf)
+            el = p.symbol + " ".join(str(vs['n'] + OrbitalType(int(vs['l'])).name)
+                                     for vs in p.valence_states.values() if 'n' in vs)
+            basis_functions.append(el)
         return basis_functions
 
     def set_basis_functions_from_abinit_pseudos(self, pseudos):
+        """
+        Sets the basis function used from the PAW abinit pseudopotentials
+
+        Args:
+            pseudos: a list of Pseudos objects.
+        """
         basis_functions = self._get_basis_functions_from_abinit_pseudos(pseudos)
 
         self.basis_functions = basis_functions
 
     @classmethod
-    def _get_basis_functions_from_potcar(cls, potcars):
+    def _get_basis_functions_from_potcar(cls, potcar):
+        """
+        Extracts the basis function used from a POTCAR.
+
+        Args:
+            potcar: a pymatgen.io.vasp.inputs.Potcar object
+        """
         basis_functions = []
         for p in potcars:
             basis_functions.append(p.element +" "+ " ".join(str(vs[0]) + vs[1] for vs in p.electron_configuration))
         return basis_functions
 
     def set_basis_functions_from_potcar(self, potcar):
+        """
+        Sets the basis function used from a POTCAR.
+
+        Args:
+            potcar: a pymatgen.io.vasp.inputs.Potcar object
+        """
         basis_functions = self._get_basis_functions_from_potcar(potcar)
 
         self.basis_functions = basis_functions
@@ -302,10 +452,10 @@ class LobsterInput(object):
         lines = []
 
         if self.basis_set:
-            lines.append("basisSet "+self.basis_set)
+            lines.append("basisSet {}".format(self.basis_set))
 
         for bf in self.basis_functions:
-            lines.append("basisFunctions "+bf)
+            lines.append("basisFunctions {}".format(bf))
 
         for ap in self.atom_pairs:
             line = "cohpBetween atom {} atom {}".format(*ap)
@@ -337,12 +487,27 @@ class LobsterInput(object):
             lines.append("BWDF {}".format(self.bwdf))
 
         for k, v in self.advanced_options.items():
-            lines.append(k + str(k))
+            lines.append("{} {}".format(k, v))
 
         return "\n".join(lines)
 
     @classmethod
-    def from_run_dir(cls, dirpath, dE=0.01, set_pairs=False, **kwargs):
+    def from_run_dir(cls, dirpath, dE=0.01, **kwargs):
+        """
+        Generates an instance of the class based on the output folder of a DFT calculation.
+        Reads the information from the pseudopotentials in order to determine the
+        basis functions.
+
+        Args:
+            dirpath: the path to the calculation directory. For abinit it should contain the
+                "files" file, for vasp it should contain the vasprun.xml and the POTCAR.
+            dE: The spacing of the energy sampling in eV.
+            kwargs: the inputs for the init method, except for basis_functions, start_en,
+                end_en and en_steps.
+
+        Returns:
+            A LobsterInput.
+        """
 
         # Try to determine the code used for the calculation
         dft_code = None
@@ -352,51 +517,60 @@ class LobsterInput(object):
 
             en_min = np.min([bands_spin for bands_spin in vr.eigenvalues.values()])
             en_max = np.max([bands_spin for bands_spin in vr.eigenvalues.values()])
-            efermi = vr.efermi
+            fermie = vr.efermi
 
-            #TODO read potcar (PotcarSingle object). Done?
-            potcar = Potcar.from_file('POTCAR')
+            potcar = Potcar.from_file(os.path.join(dirpath, 'POTCAR'))
             basis_functions = cls._get_basis_functions_from_potcar(potcar)
 
         elif glob.glob(os.path.join(dirpath, '*.files')):
             dft_code = "abinit"
             ff = glob.glob(os.path.join(dirpath, '*.files'))[0]
-            out_path = linecache.getline(ff, 4).strip()
+            with open(ff, "rt") as files_file:
+                ff_lines = files_file.readlines()
+            out_path = ff_lines[3].strip()
             if not os.path.isabs(out_path):
                 out_path = os.path.join(dirpath, out_path)
 
-            gsr = ETSF_Reader(out_path+'_GSR.nc')
+            gsr = GsrFile.from_file(out_path+'_GSR.nc')
 
-            eigenvalues = gsr.read_value('eigenvalues')
-            en_min = eigenvalues.min()
-            en_max = eigenvalues.max()
-            efermi = gsr.read_value('fermi_energy')
+            en_min = gsr.ebands.eigens.min()
+            en_max = gsr.ebands.eigens.max()
+            fermie = gsr.ebands.fermie
 
-            basis_functions = cls._get_basis_functions_from_abinit_pseudos()
+            pseudo_paths = []
+            for l in ff_lines[5:]:
+                l = l.strip()
+                if l:
+                    if not os.path.isabs(l):
+                        l = os.path.join(dirpath, l)
+                    pseudo_paths.append(l)
+
+            pseudos = [Pseudo.from_file(p) for p in pseudo_paths]
+
+            basis_functions = cls._get_basis_functions_from_abinit_pseudos(pseudos)
         else:
             raise ValueError('Unable to determine the code used in dir {}'.format(dirpath))
 
-        start_en = en_min + efermi
-        end_en = en_max - efermi
+        start_en = en_min + fermie
+        end_en = en_max - fermie
 
         # shift the energies so that are divisible by dE and the value for the fermi level (0 eV) is included
         start_en = np.floor(start_en/dE)*dE
         end_en= np.ceil(end_en/dE)*dE
 
-        en_steps = (end_en-start_en)/dE
+        en_steps = int((end_en-start_en)/dE)
 
         return cls(basis_functions=basis_functions, start_en=start_en, end_en=end_en, en_steps=en_steps, **kwargs)
 
 
-    def write_file(self, dirpath='.'):
+    def write(self, dirpath='.'):
         """
-        Write the input file 'lobsterin' in 'dirpath'.
+        Write the input file 'lobsterin' in dirpath.
         """
+
         if not os.path.exists(dirpath):
             os.makedirs(dirpath)
 
         # Write the input file.
         with open(os.path.join(dirpath, 'lobsterin'), "wt") as f:
             f.write(str(self))
-
-
